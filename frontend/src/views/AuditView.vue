@@ -5,12 +5,14 @@
       <textarea v-model="contractCode" class="code-editor" placeholder="// 粘贴 Solidity 合约代码..."></textarea>
       <div class="toolbar">
         <input v-model="filename" placeholder="文件名.sol" class="filename-input" />
-        <button @click="runAudit" class="btn-primary" :disabled="!contractCode">
+        <button @click="runAudit" class="btn-primary" :disabled="!contractCode || isAuditing">
           {{ isAuditing ? "审计中..." : "开始审计" }}
         </button>
       </div>
     </div>
-    <div v-if="result" class="result-section">
+    <div v-if="error" class="error-banner">{{ error }}</div>
+    <div v-if="isAuditing" class="audit-loading">正在按当前代码重新分析，请稍候…</div>
+    <div v-else-if="result" class="result-section">
       <div class="score-card" :class="scoreClass">
         <div class="score-label">安全评分</div>
         <div class="score-value">{{ result.score }}</div>
@@ -18,10 +20,10 @@
       </div>
       <div class="vulnerabilities">
         <h3>发现漏洞 ({{ result.vulnerabilities.length }})</h3>
-        <div v-for="v in result.vulnerabilities" :key="v.line + v.type" class="vuln-card" :class="v.severity">
+        <div v-for="v in result.vulnerabilities" :key="v.id" class="vuln-card" :class="v.severity">
           <div class="vuln-header">
             <span class="vuln-type">{{ v.type }}</span>
-            <span class="vuln-severity">{{ v.severity }}</span>
+            <span class="vuln-severity" :class="v.severity">{{ v.severity }} · 第{{ v.line }}行</span>
           </div>
           <div class="vuln-desc">{{ v.description }}</div>
           <div class="vuln-suggest">建议: {{ v.suggestion }}</div>
@@ -29,7 +31,7 @@
       </div>
       <div v-if="result.gasIssues.length > 0" class="gas-section">
         <h3>Gas优化建议</h3>
-        <div v-for="g in result.gasIssues" :key="g.functionName" class="gas-card">
+        <div v-for="g in result.gasIssues" :key="g.id" class="gas-card">
           <div class="gas-fn">{{ g.functionName }}</div>
           <div class="gas-info">当前: {{ g.currentGas }} → 优化后: {{ g.optimizedGas }} ({{ Math.round((1-g.optimizedGas/g.currentGas)*100) }}%节省)</div>
           <div class="gas-suggest">{{ g.suggestion }}</div>
@@ -40,18 +42,23 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from "vue"
+import { ref, computed, onMounted } from "vue"
+import { useRoute } from "vue-router"
+import { useAuditStore, type AuditResult } from "@/store"
+
+const store = useAuditStore()
+const route = useRoute()
 
 const contractCode = ref(`// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 contract SimpleBank {
     mapping(address => uint) public balances;
-    
+
     function deposit() public payable {
         balances[msg.sender] += msg.value;
     }
-    
+
     function withdraw(uint amount) public {
         require(balances[msg.sender] >= amount);
         (bool success,) = msg.sender.call{value: amount}("");
@@ -61,7 +68,10 @@ contract SimpleBank {
 }`)
 const filename = ref("SimpleBank.sol")
 const isAuditing = ref(false)
-const result = ref<any>(null)
+const error = ref("")
+
+// 结果直接以 store 为唯一数据源：历史入口带 id 跳进来时也能看到同一份合约的最新结论
+const result = computed<AuditResult | null>(() => store.currentResult)
 
 const scoreClass = computed(() => {
   if (!result.value) return ""
@@ -80,39 +90,31 @@ const scoreGrade = computed(() => {
 
 async function runAudit() {
   isAuditing.value = true
-  await new Promise(r => setTimeout(r, 1500))
-  
-  // Simulate vulnerability detection
-  const vulns = []
-  if (contractCode.value.includes("msg.sender.call")) {
-    vulns.push({
-      type: "重入攻击 (Reentrancy)",
-      severity: "critical",
-      line: contractCode.value.split("\n").findIndex(l => l.includes("msg.sender.call")) + 1,
-      description: "使用了低级的 call() 接收ETH，存在重入攻击风险。攻击者可通过恶意合约反复调用提款函数。",
-      suggestion: "使用 Checks-Effects-Interactions 模式，或使用 ReentrancyGuard 修饰符。"
-    })
+  // 先清掉上一份合约的卡片与评分，等待期间不再显示旧结论
+  store.currentResult = null
+  error.value = ""
+  try {
+    await store.uploadAndAudit(contractCode.value, filename.value.trim() || "未命名合约.sol")
+  } catch (e: any) {
+    error.value = e?.response?.data?.detail || "审计请求失败，请确认后端服务已启动"
+  } finally {
+    isAuditing.value = false
   }
-  if (contractCode.value.includes("require(balances")) {
-    vulns.push({
-      type: "整数溢出 (Integer Overflow)",
-      severity: "high",
-      line: 1,
-      description: "Solidity 0.8以下版本未启用溢出检查，需注意。",
-      suggestion: "使用 SafeMath 库或在 Solidity 0.8+ 环境中编译。"
-    })
-  }
-  
-  result.value = {
-    score: vulns.length === 0 ? 95 : Math.max(20, 85 - vulns.length * 25),
-    vulnerabilities: vulns,
-    gasIssues: [
-      { functionName: "deposit()", currentGas: 45000, optimizedGas: 21000, suggestion: "移除不必要的存储写入" },
-      { functionName: "withdraw()", currentGas: 52000, optimizedGas: 31000, suggestion: "使用 local 变量缓存 balances[msg.sender]" }
-    ]
-  }
-  isAuditing.value = false
 }
+
+onMounted(async () => {
+  // 从历史等入口跳转：/?id=xxx 时拉取该份合约的最新结论
+  const id = route.query.id
+  if (id && (!store.currentResult || store.currentResult.id !== id)) {
+    try {
+      const detail = await store.fetchAudit(String(id))
+      contractCode.value = detail.code ?? contractCode.value
+      filename.value = detail.filename
+    } catch {
+      // 记录已不存在时停留在空白结果态
+    }
+  }
+})
 </script>
 
 <style scoped>
@@ -122,6 +124,8 @@ async function runAudit() {
 .filename-input { padding: 0.5rem 1rem; border: 1px solid #d1d5db; border-radius: 8px; flex: 1; }
 .btn-primary { background: #8b5cf6; color: white; border: none; padding: 0.625rem 1.5rem; border-radius: 8px; cursor: pointer; white-space: nowrap; }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.error-banner { margin-top: 1rem; padding: 0.75rem 1rem; background: #fee2e2; color: #dc2626; border-radius: 8px; }
+.audit-loading { margin-top: 2rem; text-align: center; color: #6b7280; padding: 2rem; }
 .result-section { margin-top: 2rem; }
 .score-card { border-radius: 16px; padding: 2rem; text-align: center; color: white; margin-bottom: 2rem; }
 .score-high { background: linear-gradient(135deg, #10b981, #059669); }
@@ -138,7 +142,11 @@ async function runAudit() {
 .vuln-card.low { border-color: #6b7280; }
 .vuln-header { display: flex; justify-content: space-between; margin-bottom: 0.75rem; }
 .vuln-type { font-weight: 600; }
-.vuln-severity { padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; background: #fee2e2; color: #dc2626; }
+.vuln-severity { padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; background: #f3f4f6; color: #374151; }
+.vuln-severity.critical { background: #fee2e2; color: #dc2626; }
+.vuln-severity.high { background: #fef3c7; color: #d97706; }
+.vuln-severity.medium { background: #dbeafe; color: #1d4ed8; }
+.vuln-severity.low { background: #f3f4f6; color: #374151; }
 .vuln-desc { color: #374151; margin-bottom: 0.5rem; }
 .vuln-suggest { font-size: 0.875rem; color: #6b7280; }
 .gas-card { background: white; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
