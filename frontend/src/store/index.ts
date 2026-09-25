@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import axios from 'axios'
+import type { ApiResponse } from '@/types'
 
 export interface AuditResult {
   id: string
@@ -17,6 +18,7 @@ export interface Vulnerability {
   line: number
   description: string
   suggestion: string
+  code?: string
 }
 
 export interface GasIssue {
@@ -33,9 +35,18 @@ export const useAuditStore = defineStore('audit', () => {
 
   async function uploadAndAudit(code: string, filename: string) {
     const res = await axios.post<ApiResponse<AuditResult>>('/api/audit', { code, filename })
-    currentResult.value = res.data.data
-    results.value.unshift(res.data.data)
-    return res.data.data
+    const data = res.data.data
+    currentResult.value = data
+    // Same contract (same id/filename) gets its record replaced, not duplicated
+    const idx = results.value.findIndex(r => r.id === data.id || r.filename === data.filename)
+    if (idx >= 0) results.value.splice(idx, 1)
+    results.value.unshift(data)
+    return data
+  }
+
+  async function fetchHistory() {
+    const res = await axios.get<ApiResponse<AuditResult[]>>('/api/history')
+    results.value = res.data.data
   }
 
   async function fetchPatterns() {
@@ -43,5 +54,5 @@ export const useAuditStore = defineStore('audit', () => {
     patterns.value = res.data.data
   }
 
-  return { results, currentResult, patterns, uploadAndAudit, fetchPatterns }
+  return { results, currentResult, patterns, uploadAndAudit, fetchHistory, fetchPatterns }
 })

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import re
 import uuid
 import random
@@ -68,6 +68,10 @@ class AuditRequest(BaseModel):
     code: str
     filename: str
 
+# In-memory audit history, keyed by filename: re-auditing the same contract
+# updates its record in place instead of piling up stale duplicates.
+AUDIT_HISTORY: Dict[str, dict] = {}
+
 def detect_vulnerabilities(code: str) -> List[dict]:
     """Scan code for vulnerability patterns"""
     lines = code.split("\n")
@@ -128,21 +132,31 @@ async def audit_contract(request: AuditRequest):
     vulnerabilities = detect_vulnerabilities(request.code)
     gas_issues = compute_gas_issues(request.code)
     score = compute_security_score(vulnerabilities)
-    
+
+    existing = AUDIT_HISTORY.get(request.filename)
     result = {
-        "id": str(uuid.uuid4()),
+        "id": existing["id"] if existing else str(uuid.uuid4()),
         "filename": request.filename,
         "score": score,
         "vulnerabilities": vulnerabilities,
         "gasIssues": gas_issues,
         "timestamp": datetime.now().isoformat()
     }
-    
+    AUDIT_HISTORY[request.filename] = result
+
     return {"code": 0, "message": "success", "data": result}
 
 @app.get("/api/history")
 async def get_history():
-    return {"code": 0, "message": "success", "data": []}
+    records = sorted(AUDIT_HISTORY.values(), key=lambda r: r["timestamp"], reverse=True)
+    return {"code": 0, "message": "success", "data": records}
+
+@app.get("/api/audit/{audit_id}")
+async def get_audit(audit_id: str):
+    for record in AUDIT_HISTORY.values():
+        if record["id"] == audit_id:
+            return {"code": 0, "message": "success", "data": record}
+    raise HTTPException(status_code=404, detail="audit not found")
 
 @app.post("/api/report/{audit_id}")
 async def generate_report(audit_id: str):
